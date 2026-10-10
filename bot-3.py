@@ -1,10 +1,10 @@
 import asyncio, html, io, json, logging, math, os, re, shutil, sqlite3, time, unicodedata
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 
 import aiohttp, aiosqlite
 from aiogram import Bot, Dispatcher, F, Router, BaseMiddleware
 from aiogram.client.default import DefaultBotProperties
-from aiogram.filters import Command, CommandStart
+from aiogram.filters import BaseFilter, Command, CommandStart
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.fsm.storage.memory import MemoryStorage
@@ -51,7 +51,7 @@ DEFAULTS = {
     "ton_fee_pct_hi": "2.5",       # بالاتر از ton_hi_threshold
     "ton_mid_threshold": "1.5", "ton_hi_threshold": "10",
     "ton_net_fee_ton": "0.01",     # کارمزد واقعی شبکه برای هر انتقال تون (TON) - هم خرید هم برداشت
-    "kyc_limit": "400000",         # سقف مجموع خرید بدون احراز هویت (تومان)
+    "kyc_limit": "400000",         # سقف خرید «روزانه» بدون احراز هویت (تومان)؛ ساعت ۱۲ شب ریست میشه
     "ton_source": "channel",       # منبع قیمت دلاری تون: channel (کانال) یا binance
     "ton_toman_manual": "0",       # اگه >0 باشه قیمت بازار هر تون (تومان) دستیه و از دلار حساب نمیشه
     "usdt_toman_manual": "0",      # اگر >0 باشه به جای نوبیتکس استفاده میشه
@@ -59,6 +59,9 @@ DEFAULTS = {
     "disc_pct_ton": "0.5",         # درصد تخفیف (کش‌بک) روی هر خرید تون
     "disc_pct_stars": "0.5",       # استارز (فقط از star_free_below به بالا؛ زیرش سود صفره پس تخفیف هم صفره)
     "disc_pct_prem": "0.5",        # پرمیوم
+    "disc_pct_custom": "0.5",      # تخفیف (کش‌بک) محصولات سفارشی
+    "sale_pct_ton": "0", "sale_pct_stars": "0", "sale_pct_prem": "0",   # تخفیف ویژه روی قیمت (با /sale)
+    "off_ton": "0", "off_stars": "0", "off_prem3": "0", "off_prem6": "0", "off_prem12": "0",   # 1 = ناموجود
     "topup_min": "10000",          # حداقل شارژ ریالی (تومان)
 }
 
@@ -75,6 +78,9 @@ CREATE TABLE IF NOT EXISTS kyc(id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INT
 CREATE TABLE IF NOT EXISTS settings(k TEXT PRIMARY KEY, v TEXT);
 CREATE TABLE IF NOT EXISTS support(chat_id INTEGER, msg_id INTEGER, user_id INTEGER, PRIMARY KEY(chat_id,msg_id));
 CREATE TABLE IF NOT EXISTS discounts(id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER, amount INTEGER, reason TEXT, created REAL);
+CREATE TABLE IF NOT EXISTS categories(id INTEGER PRIMARY KEY AUTOINCREMENT, title TEXT, active INTEGER DEFAULT 1, created REAL);
+CREATE TABLE IF NOT EXISTS products(id INTEGER PRIMARY KEY AUTOINCREMENT, category TEXT, title TEXT,
+  price_toman INTEGER, needs_target INTEGER DEFAULT 1, active INTEGER DEFAULT 1, sale_pct REAL DEFAULT 0, created REAL);
 CREATE UNIQUE INDEX IF NOT EXISTS ux_track ON orders(tracking) WHERE tracking IS NOT NULL AND status IN ('pending','approved');
 """
 
@@ -132,6 +138,10 @@ def num(s):
         v = float(norm(s)); return v if v > 0 else None
     except Exception:
         return None
+IR_TZ = timezone(timedelta(hours=3, minutes=30))     # وقت ایران
+def day_start():
+    n = datetime.now(IR_TZ)
+    return n.replace(hour=0, minute=0, second=0, microsecond=0).timestamp()   # ساعت ۱۲ شب
 def ts_fmt(t): return datetime.fromtimestamp(t).strftime("%Y/%m/%d %H:%M")
 
 # ───────────────────────── prices ─────────────────────────
@@ -384,12 +394,35 @@ class Kyc(StatesGroup): card = State(); photo = State()
 class Wd(StatesGroup): amount = State(); address = State(); memo = State(); confirm = State()
 class Support(StatesGroup): msg = State()
 class Topup(StatesGroup): amount = State()
+class CustomBuy(StatesGroup): target = State()
 
-MENU = ReplyKeyboardMarkup(resize_keyboard=True, keyboard=[
-    [KeyboardButton(text="🛒 خرید تون"), KeyboardButton(text="⭐ خرید استارز")],
-    [KeyboardButton(text="💎 تلگرام پرمیوم"), KeyboardButton(text="👤 حساب من")],
-    [KeyboardButton(text="📜 تاریخچه"), KeyboardButton(text="💸 برداشت")],
-    [KeyboardButton(text="🆘 پشتیبانی")]])
+BASE_ROWS = [["🛒 خرید تون", "⭐ خرید استارز"], ["💎 تلگرام پرمیوم", "👤 حساب من"], ["📜 تاریخچه", "💸 برداشت"]]
+RESERVED_TITLES = {t for r in BASE_ROWS for t in r} | {"🛍 سایر محصولات", "🆘 پشتیبانی", "🎛 پنل مدیریت"}
+
+async def menu_categories():
+    """دکمه‌های اضافه‌ی منو: «سایر محصولات» + دسته‌هایی که ادمین ساخته (فقط اگه حداقل یک محصول دارن)"""
+    out = []
+    if (await fetchone("SELECT COUNT(*) c FROM products WHERE category='other'"))["c"]:
+        out.append("🛍 سایر محصولات")
+    for c in await fetchall("SELECT * FROM categories WHERE active=1 ORDER BY id"):
+        if (await fetchone("SELECT COUNT(*) c FROM products WHERE category=?", (f"c{c['id']}",)))["c"]:
+            out.append(c["title"])
+    return out
+
+async def main_menu():
+    rows = [[KeyboardButton(text=t) for t in r] for r in BASE_ROWS]
+    cats = await menu_categories()
+    for i in range(0, len(cats), 2):
+        rows.append([KeyboardButton(text=t) for t in cats[i:i + 2]])
+    rows.append([KeyboardButton(text="🆘 پشتیبانی")])
+    return ReplyKeyboardMarkup(resize_keyboard=True, keyboard=rows)
+
+class CatFilter(BaseFilter):
+    """پیام = اسم یکی از دکمه‌های دسته‌ای که ادمین ساخته"""
+    async def __call__(self, message: Message):
+        if not getattr(message, "text", None): return False
+        r = await fetchone("SELECT * FROM categories WHERE active=1 AND title=?", (message.text.strip(),))
+        return {"cat": r} if r else False
 
 async def get_user(uid):
     return await fetchone("SELECT * FROM users WHERE id=?", (uid,))
@@ -412,7 +445,7 @@ async def start(m: Message, state: FSMContext):
                   (m.from_user.id, m.from_user.username, now()))
     u = await get_user(m.from_user.id)
     if not u["phone"]: return await ask_phone(m)
-    await m.answer("سلام 👋 به ربات خرید تون، استارز و پرمیوم تلگرام خوش اومدی.\nاز منوی زیر انتخاب کن:", reply_markup=MENU)
+    await m.answer("سلام 👋 به ربات خرید تون، استارز و پرمیوم تلگرام خوش اومدی.\nاز منوی زیر انتخاب کن:", reply_markup=await main_menu())
 
 @ur.message(F.contact)
 async def got_contact(m: Message):
@@ -420,13 +453,42 @@ async def got_contact(m: Message):
         return await m.answer("لطفا فقط شماره‌ی خودتان را با دکمه ارسال کنید.")
     await execute("UPDATE users SET phone=?, username=? WHERE id=?",
                   (m.contact.phone_number, m.from_user.username, m.from_user.id))
-    await m.answer("✅ شماره ثبت شد. خوش آمدید!", reply_markup=MENU)
+    await m.answer("✅ شماره ثبت شد. خوش آمدید!", reply_markup=await main_menu())
+
+async def available(key):
+    return (await sget(f"off_{key}")) != "1"
+
+def prod_eff_price(pr):
+    sale = round((pr["price_toman"] * (pr["sale_pct"] or 0) / 100) / 100) * 100
+    return int(pr["price_toman"] - sale)
+
+async def products_kb(category, extra_rows=None):
+    rows = list(extra_rows or [])
+    for pr in await fetchall("SELECT * FROM products WHERE category=? ORDER BY id", (category,)):
+        if pr["active"]:
+            rows.append([InlineKeyboardButton(text=f"{pr['title']} — {fm(prod_eff_price(pr))} تومان", callback_data=f"cp:{pr['id']}")])
+        else:
+            rows.append([InlineKeyboardButton(text=f"⛔ {pr['title']} — ناموجود", callback_data="na")])
+    return rows
+
+@ur.callback_query(F.data == "na")
+async def not_available(c: CallbackQuery):
+    await c.answer("⛔ این محصول فعلا موجود نیست.", show_alert=True)
 
 # ── menu (registered first so they work in any state) ──
+@ur.message(CatFilter())
+async def open_cat(m: Message, state: FSMContext, cat):
+    await state.clear()
+    if not await phone_ok(m): return
+    rows = await products_kb(f"c{cat['id']}")
+    if not rows: return await m.answer("فعلا محصولی ثبت نشده است.")
+    await m.answer(esc(cat["title"]) + ":", reply_markup=InlineKeyboardMarkup(inline_keyboard=rows))
+
 @ur.message(F.text == "🛒 خرید تون")
 async def buy_ton(m: Message, state: FSMContext):
     await state.clear()
     if not await phone_ok(m): return
+    if not await available("ton"): return await m.answer("⛔ فعلا خرید تون موجود نیست.")
     if not await price_ready(): return await m.answer("⏳ قیمت‌ها در حال بروزرسانی است، کمی بعد تلاش کنید.")
     q = await ton_quote(ton=1.0)
     kb = InlineKeyboardMarkup(inline_keyboard=[
@@ -439,6 +501,7 @@ async def buy_ton(m: Message, state: FSMContext):
 async def buy_stars(m: Message, state: FSMContext):
     await state.clear()
     if not await phone_ok(m): return
+    if not await available("stars"): return await m.answer("⛔ فعلا خرید استارز موجود نیست.")
     if not await price_ready(): return await m.answer("⏳ قیمت‌ها در حال بروزرسانی است، کمی بعد تلاش کنید.")
     await state.set_state(BuyStars.target)
     await m.answer("آیدی (یوزرنیم) تلگرامی که استارز براش خریده میشه رو بفرست، مثل @username")
@@ -447,16 +510,47 @@ async def buy_stars(m: Message, state: FSMContext):
 async def buy_prem(m: Message, state: FSMContext):
     await state.clear()
     if not await phone_ok(m): return
-    if not await price_ready(): return await m.answer("⏳ قیمت‌ها در حال بروزرسانی است، کمی بعد تلاش کنید.")
     rows = []
+    ready = await price_ready()
     for mo in (3, 6, 12):
-        rows.append([InlineKeyboardButton(text=f"{mo} ماهه — {fm(await premium_price(mo))} تومان",
-                                          callback_data=f"prem:{mo}")])
+        if not await available(f"prem{mo}"):
+            rows.append([InlineKeyboardButton(text=f"⛔ {mo} ماهه — ناموجود", callback_data="na")])
+        elif ready:
+            rows.append([InlineKeyboardButton(text=f"{mo} ماهه — {fm(await premium_price_final(mo))} تومان",
+                                              callback_data=f"prem:{mo}")])
+    rows = await products_kb("prem", rows)
+    if not rows: return await m.answer("⏳ قیمت‌ها در حال بروزرسانی است، کمی بعد تلاش کنید.")
     await m.answer("پلن پرمیوم را انتخاب کنید:", reply_markup=InlineKeyboardMarkup(inline_keyboard=rows))
 
+@ur.message(F.text == "🛍 سایر محصولات")
+async def others(m: Message, state: FSMContext):
+    await state.clear()
+    if not await phone_ok(m): return
+    rows = await products_kb("other")
+    if not rows: return await m.answer("فعلا محصولی ثبت نشده است.")
+    await m.answer("🛍 محصولات:", reply_markup=InlineKeyboardMarkup(inline_keyboard=rows))
+
+@ur.callback_query(F.data.startswith("cp:"))
+async def cp_pick(c: CallbackQuery, state: FSMContext):
+    pr = await fetchone("SELECT * FROM products WHERE id=?", (int(c.data.split(":")[1]),))
+    if not pr or not pr["active"]: return await c.answer("⛔ این محصول فعلا موجود نیست.", show_alert=True)
+    await c.answer()
+    if pr["needs_target"]:
+        await state.set_state(CustomBuy.target); await state.update_data(pid=pr["id"])
+        return await c.message.answer("آیدی (یوزرنیم) تلگرام گیرنده را بفرستید، مثل @username")
+    await show_confirm(c.message, state, "custom", {"pid": pr["id"]})
+
+@ur.message(CustomBuy.target, F.text)
+async def cp_target(m: Message, state: FSMContext):
+    t = m.text.strip()
+    if not re.fullmatch(r"@?[A-Za-z0-9_]{5,32}", t): return await m.answer("آیدی نامعتبر است. مثل @username بفرستید.")
+    pid = (await state.get_data())["pid"]
+    await show_confirm(m, state, "custom", {"pid": pid, "target": "@" + t.lstrip("@")})
+
 async def card_used(uid):
+    """مجموع مبلغ کارتی امروز (از ساعت ۱۲ شب به وقت ایران)"""
     r = await fetchone("SELECT COALESCE(SUM(COALESCE(card_toman,toman)),0) s FROM orders "
-                       "WHERE user_id=? AND status IN ('pending','approved')", (uid,))
+                       "WHERE user_id=? AND status IN ('pending','approved') AND created>=?", (uid, day_start()))
     return r["s"]
 
 @ur.message(F.text == "👤 حساب من")
@@ -468,7 +562,8 @@ async def account(m: Message, state: FSMContext):
     if u["kyc"]:
         kyc = "✅ تایید شده (بدون سقف)"
     else:
-        kyc = f"❌ انجام نشده\n   سقف باقی‌مانده بدون احراز: {fm(max(limit - used, 0))} از {fm(limit)} تومان"
+        kyc = (f"❌ انجام نشده\n   سقف خرید روزانه: امروز {fm(max(limit - used, 0))} از {fm(limit)} تومان باقی مانده "
+               "(هر شب ساعت ۱۲ ریست می‌شود)")
     buys = await fetchone("SELECT COALESCE(SUM(toman),0) s, COUNT(*) c FROM orders WHERE user_id=? AND status='approved' AND kind!='topup'", (m.from_user.id,))
     rows = [[InlineKeyboardButton(text="➕ شارژ کیف پول ریالی", callback_data="acc:topup")],
             [InlineKeyboardButton(text="🎁 تخفیف‌های من", callback_data="acc:disc")]]
@@ -556,8 +651,29 @@ async def support_msg(m: Message, state: FSMContext):
     await m.answer("✅ پیام شما ارسال شد. پاسخ از همین ربات به شما می‌رسد.")
 
 # ── build pending purchase ──
+PAY_RE = re.compile(r"💳 مبلغ قابل واریز: <b>[\d,]+</b> تومان")
+
+async def kind_available(kind, p):
+    if kind in ("ton", "stars"): return await available(kind)
+    if kind == "prem": return await available(f"prem{p['months']}")
+    if kind == "custom":
+        pr = await fetchone("SELECT active FROM products WHERE id=?", (p["pid"],))
+        return bool(pr and pr["active"])
+    return True
+
+async def sale_pct(kind, p):
+    if kind == "custom":
+        pr = await fetchone("SELECT sale_pct FROM products WHERE id=?", (p["pid"],))
+        return float(pr["sale_pct"] or 0) if pr else 0.0
+    key = {"ton": "sale_pct_ton", "stars": "sale_pct_stars", "prem": "sale_pct_prem"}.get(kind)
+    return await sf(key) if key else 0.0
+
+async def premium_price_final(months):
+    price = await premium_price(months); pct = await sf("sale_pct_prem")
+    return price - int(round(price * pct / 100 / 100) * 100) if pct > 0 else price
+
 async def calc_discount(kind, toman, p):
-    key = {"ton": "disc_pct_ton", "stars": "disc_pct_stars", "prem": "disc_pct_prem"}.get(kind)
+    key = {"ton": "disc_pct_ton", "stars": "disc_pct_stars", "prem": "disc_pct_prem", "custom": "disc_pct_custom"}.get(kind)
     if not key: return 0
     if kind == "stars" and p["count"] < await sf("star_free_below"): return 0   # زیر آستانه سود صفره
     return int(round(toman * await sf(key) / 100 / 100) * 100)
@@ -565,6 +681,14 @@ async def calc_discount(kind, toman, p):
 async def build(kind, p):
     pend = await _build(kind, p)
     if not pend: return None
+    pct = await sale_pct(kind, p)
+    if pct > 0 and kind != "topup":                        # تخفیف ویژه ادمین روی قیمت
+        sale = int(round(pend["toman"] * pct / 100 / 100) * 100)
+        if sale > 0:
+            new = pend["toman"] - sale
+            pend["text"] = PAY_RE.sub(lambda m_: f"🔥 تخفیف ویژه ({pct:g}٪): <b>-{fm(sale)}</b> تومان\n"
+                                                 f"💳 مبلغ قابل واریز: <b>{fm(new)}</b> تومان", pend["text"])
+            pend["toman"] = new
     pend["discount"] = await calc_discount(kind, pend["toman"], p)
     if pend["discount"] > 0:
         pend["text"] += (f"\n\n🎁 با این خرید <b>{fm(pend['discount'])}</b> تومان تخفیف می‌گیرید "
@@ -572,6 +696,15 @@ async def build(kind, p):
     return pend
 
 async def _build(kind, p):
+    if kind == "custom":
+        pr = await fetchone("SELECT * FROM products WHERE id=?", (p["pid"],))
+        if not pr or not pr["active"]: return None
+        tgt = f"\n👤 آیدی: {esc(p['target'])}" if p.get("target") else ""
+        text = (f"🧾 <b>پیش‌فاکتور</b>\n\n📦 {esc(pr['title'])}{tgt}\n"
+                f"━━━━━━━━\n💳 مبلغ قابل واریز: <b>{fm(pr['price_toman'])}</b> تومان")
+        det = {"pid": pr["id"]}
+        if p.get("target"): det["target"] = p["target"]
+        return dict(kind="custom", title=pr["title"], details=det, toman=int(pr["price_toman"]), nano=0, text=text, ts=now())
     if kind == "topup":
         a = int(p["amount"])
         text = (f"🧾 <b>شارژ کیف پول ریالی</b>\n\n💵 مبلغ: <b>{fm(a)}</b> تومان\n"
@@ -648,6 +781,8 @@ async def stars_count(m: Message, state: FSMContext):
 # ── Premium ──
 @ur.callback_query(F.data.startswith("prem:"))
 async def prem_plan(c: CallbackQuery, state: FSMContext):
+    if not await available(f"prem{c.data.split(':')[1]}"):
+        return await c.answer("⛔ این محصول فعلا موجود نیست.", show_alert=True)
     await state.set_state(BuyPrem.target); await state.update_data(months=int(c.data.split(":")[1]))
     await c.answer()
     await c.message.answer("آیدی (یوزرنیم) اکانتی که پرمیوم براش فعال میشه رو بفرست، مثل @username")
@@ -669,9 +804,13 @@ async def co_ok(c: CallbackQuery, state: FSMContext):
     data = await state.get_data()
     if "pending" not in data: return await c.answer("منقضی شد، دوباره شروع کنید.", show_alert=True)
     pend = data["pending"]
+    if not await kind_available(data["kind"], data["params"]):
+        return await c.answer("⛔ این محصول فعلا موجود نیست.", show_alert=True)
     if time.time() - pend["ts"] > 300:
-        if not await price_ready(): return await c.answer("قیمت‌ها در حال بروزرسانی است.", show_alert=True)
+        if data["kind"] in ("ton", "stars", "prem") and not await price_ready():
+            return await c.answer("قیمت‌ها در حال بروزرسانی است.", show_alert=True)
         pend = await build(data["kind"], data["params"])
+        if not pend: return await c.answer("این محصول دیگر در دسترس نیست.", show_alert=True)
         await state.update_data(pending=pend)
         await c.answer()
         return await c.message.answer("⏱ قیمت بروز شد:\n\n" + pend["text"], reply_markup=CONFIRM_KB)
@@ -690,7 +829,9 @@ async def place_order(msg: Message, state: FSMContext, uid, pend):
         limit = int(await sf("kyc_limit"))
         if await card_used(uid) + card > limit:
             await state.set_state(Kyc.card)
-            return await msg.answer(f"🪪 برای خرید بیش از {fm(limit)} تومان (مجموع) احراز هویت لازم است.\n"
+            left = max(limit - await card_used(uid), 0)
+            return await msg.answer(f"🪪 سقف خرید روزانه بدون احراز هویت {fm(limit)} تومان است (امروز {fm(left)} تومان باقی مانده؛ "
+                                    "هر شب ساعت ۱۲ ریست می‌شود). برای خرید بیشتر احراز هویت لازم است.\n"
                                     "ابتدا شماره‌ی ۱۶ رقمی کارت بانکی خود را بفرستید:")
     await execute("UPDATE orders SET status='cancelled' WHERE user_id=? AND status='awaiting'", (uid,))
     ttl = int(await sf("order_ttl_min"))
@@ -702,7 +843,7 @@ async def place_order(msg: Message, state: FSMContext, uid, pend):
         r = await submit_order(oid)
         await state.clear()
         if r == "ok":
-            return await msg.answer("✅ سفارش شما از موجودی کیف پول ثبت و برای بررسی ارسال شد.", reply_markup=MENU)
+            return await msg.answer("✅ سفارش شما از موجودی کیف پول ثبت و برای بررسی ارسال شد.", reply_markup=await main_menu())
         return await msg.answer("موجودی شما تغییر کرده، لطفا دوباره سفارش بدهید.")
     await state.set_state(Pay.receipt); await state.update_data(order_id=oid)
     lines = [f"💰 مبلغ سفارش: {fm(total)} تومان"]
@@ -790,10 +931,10 @@ async def pay_tracking(m: Message, state: FSMContext):
     r = await submit_order(oid, BufferedInputFile(buf.getvalue(), "receipt.jpg"), code, data["uid"])
     await state.clear()
     if r == "ok":
-        return await m.answer("✅ فیش شما ثبت و برای بررسی ارسال شد. نتیجه به شما اطلاع داده می‌شود.", reply_markup=MENU)
+        return await m.answer("✅ فیش شما ثبت و برای بررسی ارسال شد. نتیجه به شما اطلاع داده می‌شود.", reply_markup=await main_menu())
     if r == "balance":
-        return await m.answer("موجودی کیف پول/تخفیف شما در این فاصله تغییر کرده. لطفا سفارش را دوباره ثبت کنید.", reply_markup=MENU)
-    await m.answer("این سفارش منقضی یا لغو شده است. دوباره سفارش بدهید.", reply_markup=MENU)
+        return await m.answer("موجودی کیف پول/تخفیف شما در این فاصله تغییر کرده. لطفا سفارش را دوباره ثبت کنید.", reply_markup=await main_menu())
+    await m.answer("این سفارش منقضی یا لغو شده است. دوباره سفارش بدهید.", reply_markup=await main_menu())
 
 # ── withdraw ──
 async def wd_set_amount(msg: Message, state: FSMContext, uid, nano):
@@ -860,7 +1001,7 @@ async def wd_ok(c: CallbackQuery, state: FSMContext):
                     f"آدرس: <code>{esc(d['address'])}</code>\nممو: <code>{esc(d['memo']) if d['memo'] else 'ندارد'}</code>",
                     kb_ok_no("wd", wid))
     await state.clear(); await c.message.edit_reply_markup(reply_markup=None); await c.answer()
-    await c.message.answer("✅ درخواست برداشت ثبت شد و پس از تایید ارسال می‌شود.", reply_markup=MENU)
+    await c.message.answer("✅ درخواست برداشت ثبت شد و پس از تایید ارسال می‌شود.", reply_markup=await main_menu())
 
 # ── background loops ──
 async def expiry_loop():
@@ -971,13 +1112,21 @@ async def adm_support_reply(m: Message):
     await m.reply("✅ ارسال شد.")
 
 @ar.message(CommandStart())
-async def adm_start(m: Message):
-    await m.answer("پنل ادمین ✅\n/stats\n/fragment (بروزرسانی دستی قیمت فراگمنت)\n/prices\n/set key value\n/setrate تومان_هر_USDT (۰ = خودکار)\n"
-                   "/ban id\n/unban id\n/credit id مقدار_تون\n/creditrial id تومان (موجودی ریالی)\n/creditdisc id تومان (تخفیف)\n/broadcast متن")
+async def adm_start(m: Message, state: FSMContext):
+    await state.clear()
+    kb = ReplyKeyboardMarkup(resize_keyboard=True, keyboard=[[KeyboardButton(text="🎛 پنل مدیریت")]])
+    await m.answer("سلام ادمین ✅\n\n🎛 برای مدیریت دکمه‌ها، محصولات، تخفیف و موجودی، «پنل مدیریت» را بزنید.\n\n"
+                   "دستورها:\n/stats\n/prices\n/set key value\n/setrate تومان_هر_USDT (۰ = خودکار)\n/setton قیمت_تون (۰ = خودکار)\n"
+                   "/ban id\n/unban id\n/credit id مقدار_تون\n/creditrial id تومان (موجودی ریالی)\n/creditdisc id تومان (تخفیف)\n"
+                   "/broadcast متن\n/cancel (انصراف از مرحله‌ی جاری)", reply_markup=kb)
+
+@ar.message(Command("cancel"))
+async def adm_cancel(m: Message, state: FSMContext):
+    await state.clear(); await m.answer("انصراف داده شد.")
 
 @ar.message(Command("prices"))
 async def adm_prices(m: Message):
-    rows = [r for r in await fetchall("SELECT k,v FROM settings ORDER BY k") if r["k"] in DEFAULTS]
+    rows = [r for r in await fetchall("SELECT k,v FROM settings ORDER BY k") if r["k"] in DEFAULTS and not r["k"].startswith("off_")]
     ut = await usdt_toman(); tb = await ton_base()
     ch = ts_fmt(P["chan_ts"]) if P["chan_ts"] else "هنوز نخونده"
     st = ", ".join(f"{k}={v:,.0f}" for k, v in sorted(TBL["stars"].items())) or "-"
@@ -1048,6 +1197,91 @@ async def adm_credit_disc(m: Message):
     await execute("INSERT INTO discounts(user_id,amount,reason,created) VALUES(?,?,?,?)", (int(p[1]), v, "هدیه از طرف فروشگاه", now()))
     await to_user(int(p[1]), f"🎁 مبلغ {fm(v)} تومان تخفیف به حساب شما اضافه شد."); await m.answer("✅")
 
+BUILTIN = {"ton": "تون", "stars": "استارز", "prem3": "پرمیوم ۳ ماهه", "prem6": "پرمیوم ۶ ماهه", "prem12": "پرمیوم ۱۲ ماهه"}
+
+async def apply_sale(t, pct):
+    """تخفیف ویژه روی قیمت. t: ton / stars / prem / all / شماره محصول. خروجی False = هدف نامعتبر"""
+    if t == "all":
+        for n in ("ton", "stars", "prem"): await execute("UPDATE settings SET v=? WHERE k=?", (str(pct), f"sale_pct_{n}"))
+        await execute("UPDATE products SET sale_pct=?", (pct,))
+    elif t in ("ton", "stars", "prem"):
+        await execute("UPDATE settings SET v=? WHERE k=?", (str(pct), f"sale_pct_{t}"))
+    elif t.isdigit():
+        _, rc = await execute("UPDATE products SET sale_pct=? WHERE id=?", (pct, int(t)))
+        if not rc: return False
+    else:
+        return False
+    return True
+
+@ar.message(Command("sale"))
+async def adm_sale(m: Message):
+    p = m.text.split()
+    if len(p) != 3:
+        rows = [f"{n}: {await sget('sale_pct_' + n)}٪" for n in ("ton", "stars", "prem")]
+        cust = [f"#{r['id']} {r['title']}: {r['sale_pct']:g}٪" for r in await fetchall("SELECT * FROM products WHERE sale_pct>0")]
+        return await m.answer("🔥 تخفیف‌های فعال:\n" + "\n".join(rows + cust) +
+                              "\n\nاستفاده: /sale ton|stars|prem|all|شماره_محصول درصد (۰ = خاموش)\nمثال: /sale ton 3")
+    try: pct = float(norm(p[2]))
+    except Exception: return await m.answer("درصد معتبر وارد کنید.")
+    if not (0 <= pct <= 50): return await m.answer("درصد باید بین ۰ تا ۵۰ باشد.")
+    if not await apply_sale(p[1].lower(), pct): return await m.answer("هدف نامعتبر. ton / stars / prem / all / شماره محصول")
+    await m.answer(f"✅ تخفیف ویژه {p[1]}: {pct:g}٪" if pct else f"✅ تخفیف {p[1]} خاموش شد.")
+
+@ar.message(Command("addproduct"))
+async def adm_addproduct(m: Message):
+    p = m.text.split(maxsplit=3)
+    if len(p) < 4 or p[1] not in ("prem", "other") or not norm(p[2]).isdigit():
+        return await m.answer("استفاده:\n/addproduct prem|other قیمت_تومان عنوان\n/addproduct other 150000 notarget عنوان\n\n"
+                              "prem = داخل منوی پرمیوم، other = دکمه‌ی «سایر محصولات»\nnotarget = یوزرنیم گیرنده پرسیده نشود")
+    cat, price, rest = p[1], int(norm(p[2])), p[3]
+    needs = 1
+    if rest.startswith("notarget "): needs, rest = 0, rest[len("notarget "):]
+    pid, _ = await execute("INSERT INTO products(category,title,price_toman,needs_target,active,created) VALUES(?,?,?,?,1,?)",
+                           (cat, rest.strip(), price, needs, now()))
+    await m.answer(f"✅ محصول #{pid} اضافه شد: {esc(rest)} — {fm(price)} تومان ({'منوی پرمیوم' if cat == 'prem' else 'سایر محصولات'})")
+
+@ar.message(Command("products"))
+async def adm_products(m: Message):
+    lines = []
+    for k, n in BUILTIN.items():
+        lines.append(f"{'⛔' if not await available(k) else '✅'} {k} — {n}")
+    for r in await fetchall("SELECT * FROM products ORDER BY id"):
+        lines.append(f"{'✅' if r['active'] else '⛔'} #{r['id']} [{r['category']}] {esc(r['title'])} — {fm(r['price_toman'])} تومان"
+                     + (f" — تخفیف {r['sale_pct']:g}٪" if r["sale_pct"] else ""))
+    await m.answer("📦 محصولات:\n" + "\n".join(lines) + "\n\n/addproduct /editprice /delproduct /off /on /sale")
+
+@ar.message(Command("editprice"))
+async def adm_editprice(m: Message):
+    p = m.text.split()
+    if len(p) != 3 or not p[1].isdigit() or not norm(p[2]).isdigit(): return await m.answer("استفاده: /editprice شماره_محصول قیمت_تومان")
+    _, rc = await execute("UPDATE products SET price_toman=? WHERE id=?", (int(norm(p[2])), int(p[1])))
+    await m.answer("✅ قیمت عوض شد." if rc else "محصولی با این شماره نیست.")
+
+@ar.message(Command("delproduct"))
+async def adm_delproduct(m: Message):
+    p = m.text.split()
+    if len(p) != 2 or not p[1].isdigit(): return await m.answer("استفاده: /delproduct شماره_محصول")
+    _, rc = await execute("DELETE FROM products WHERE id=?", (int(p[1]),))
+    await m.answer("🗑 حذف شد." if rc else "محصولی با این شماره نیست.")
+
+async def _toggle(m: Message, off):
+    p = m.text.split()
+    if len(p) != 2: return await m.answer(f"استفاده: /{'off' if off else 'on'} ton|stars|prem3|prem6|prem12|شماره_محصول")
+    k = p[1].lower()
+    if k in BUILTIN:
+        await execute("UPDATE settings SET v=? WHERE k=?", ("1" if off else "0", f"off_{k}"))
+    elif k.isdigit():
+        _, rc = await execute("UPDATE products SET active=? WHERE id=?", (0 if off else 1, int(k)))
+        if not rc: return await m.answer("محصولی با این شماره نیست.")
+    else: return await m.answer("نام نامعتبر. /products را ببینید.")
+    await m.answer(f"⛔ {k} ناموجود شد." if off else f"✅ {k} فعال شد.")
+
+@ar.message(Command("off"))
+async def adm_off(m: Message): await _toggle(m, True)
+
+@ar.message(Command("on"))
+async def adm_on(m: Message): await _toggle(m, False)
+
 @ar.message(Command("stats"))
 async def adm_stats(m: Message):
     n = (await fetchone("SELECT COUNT(*) c FROM users"))["c"]
@@ -1068,6 +1302,259 @@ async def adm_bc(m: Message):
         except Exception: pass
         await asyncio.sleep(0.05)
     await m.answer(f"✅ برای {ok} نفر ارسال شد.")
+
+# ═════════ پنل مدیریت با دکمه (بدون دستور) ═════════
+class AddCat(StatesGroup): title = State()
+class AddProd(StatesGroup): title = State(); price = State(); target = State()
+class EditPrice(StatesGroup): value = State()
+class ProdSale(StatesGroup): value = State()
+class SaleAll(StatesGroup): value = State()
+
+def ikb(rows): return InlineKeyboardMarkup(inline_keyboard=rows)
+def btn(t, d): return InlineKeyboardButton(text=t, callback_data=d)
+
+async def show(msg, text, kb=None, edit=False):
+    if edit:
+        try: return await msg.edit_text(text, reply_markup=kb)
+        except Exception: pass
+    await msg.answer(text, reply_markup=kb)
+
+async def cat_title(key):
+    if key == "prem": return "💎 منوی پرمیوم"
+    if key == "other": return "🛍 سایر محصولات"
+    r = await fetchone("SELECT title FROM categories WHERE id=?", (int(key[1:]),)) if key[1:].isdigit() else None
+    return r["title"] if r else key
+
+async def cat_keys():
+    return ["prem", "other"] + [f"c{r['id']}" for r in await fetchall("SELECT id FROM categories ORDER BY id")]
+
+PANEL_KB = ikb([[btn("🗂 دکمه‌های منو و محصولات", "ap:cats")], [btn("📦 همه محصولات", "ap:prods")],
+                [btn("⛔ موجودی تون/استارز/پرمیوم", "ap:stock")], [btn("🔥 تخفیف ویژه", "ap:sale")],
+                [btn("🔄 بروزرسانی منوی کاربران", "ap:push")]])
+
+@ar.message(F.text == "🎛 پنل مدیریت")
+@ar.message(Command("panel"))
+async def panel(m: Message, state: FSMContext):
+    await state.clear(); await m.answer("🎛 پنل مدیریت", reply_markup=PANEL_KB)
+
+@ar.callback_query(F.data == "ap:home")
+async def ap_home(c: CallbackQuery, state: FSMContext):
+    await state.clear(); await c.answer(); await show(c.message, "🎛 پنل مدیریت", PANEL_KB, edit=True)
+
+# ── دسته‌ها ──
+async def render_cats(msg, edit=True):
+    rows = []
+    for k in await cat_keys():
+        n = (await fetchone("SELECT COUNT(*) c FROM products WHERE category=?", (k,)))["c"]
+        hidden = ""
+        if k.startswith("c"):
+            r = await fetchone("SELECT active FROM categories WHERE id=?", (int(k[1:]),))
+            hidden = "" if r and r["active"] else " ⛔"
+        rows.append([btn(f"{await cat_title(k)}{hidden} ({n})", f"catv:{k}")])
+    rows += [[btn("➕ دکمه‌ی جدید در منوی ربات", "cnew")], [btn("🏠 پنل", "ap:home")]]
+    await show(msg, "🗂 دسته‌ها: هر دسته یک دکمه در منوی کاربران است (بعد از اولین محصول ظاهر می‌شود).\n"
+                    "«منوی پرمیوم» داخل بخش پرمیوم نشان داده می‌شود.", ikb(rows), edit)
+
+@ar.callback_query(F.data == "ap:cats")
+async def ap_cats(c: CallbackQuery):
+    await c.answer(); await render_cats(c.message)
+
+@ar.callback_query(F.data == "cnew")
+async def cnew(c: CallbackQuery, state: FSMContext):
+    await state.set_state(AddCat.title); await c.answer()
+    await c.message.answer("اسم دکمه را بفرستید (مثلا: 🎁 گیفت‌ها). همین اسم در منوی کاربران دیده می‌شود.\nانصراف: /cancel")
+
+@ar.message(AddCat.title, F.text)
+async def cnew_title(m: Message, state: FSMContext):
+    t = m.text.strip()
+    if not (2 <= len(t) <= 30): return await m.answer("اسم باید بین ۲ تا ۳۰ حرف باشد.")
+    if t in RESERVED_TITLES or await fetchone("SELECT id FROM categories WHERE title=?", (t,)):
+        return await m.answer("این اسم قبلا استفاده شده، اسم دیگری بفرستید.")
+    cid, _ = await execute("INSERT INTO categories(title,active,created) VALUES(?,1,?)", (t, now()))
+    await state.clear()
+    await m.answer(f"✅ دسته «{esc(t)}» ساخته شد. حالا اولین محصولش را اضافه کنید (بعدش دکمه در منو ظاهر می‌شود):",
+                   reply_markup=ikb([[btn("➕ افزودن محصول", f"pnew:c{cid}")], [btn("🗂 دسته‌ها", "ap:cats")]]))
+
+async def render_cat(msg, key, edit=True):
+    prods = await fetchall("SELECT * FROM products WHERE category=? ORDER BY id", (key,))
+    rows = [[btn(f"{'✅' if p['active'] else '⛔'} {p['title']} — {fm(p['price_toman'])}", f"pv:{p['id']}")] for p in prods]
+    rows.append([btn("➕ افزودن محصول", f"pnew:{key}")])
+    if key.startswith("c") and key[1:].isdigit():
+        cr = await fetchone("SELECT active FROM categories WHERE id=?", (int(key[1:]),))
+        if cr:
+            rows.append([btn("⛔ پنهان کردن دکمه" if cr["active"] else "✅ نمایش دکمه", f"ctog:{key[1:]}"),
+                         btn("🗑 حذف دسته", f"cdel:{key[1:]}")])
+    rows.append([btn("🔙 دسته‌ها", "ap:cats")])
+    await show(msg, f"🗂 <b>{esc(await cat_title(key))}</b>\nتعداد محصولات: {len(prods)}", ikb(rows), edit)
+
+@ar.callback_query(F.data.startswith("catv:"))
+async def catv(c: CallbackQuery):
+    await c.answer(); await render_cat(c.message, c.data.split(":", 1)[1])
+
+@ar.callback_query(F.data.startswith("ctog:"))
+async def ctog(c: CallbackQuery):
+    cid = int(c.data.split(":")[1])
+    await execute("UPDATE categories SET active=1-active WHERE id=?", (cid,))
+    await c.answer("انجام شد"); await render_cat(c.message, f"c{cid}")
+
+@ar.callback_query(F.data.startswith("cdel:"))
+async def cdel(c: CallbackQuery):
+    cid = int(c.data.split(":")[1])
+    if (await fetchone("SELECT COUNT(*) c FROM products WHERE category=?", (f"c{cid}",)))["c"]:
+        return await c.answer("اول محصولات این دسته را حذف کنید.", show_alert=True)
+    await execute("DELETE FROM categories WHERE id=?", (cid,))
+    await c.answer("🗑 حذف شد"); await render_cats(c.message)
+
+# ── افزودن محصول ──
+@ar.callback_query(F.data.startswith("pnew:"))
+async def pnew(c: CallbackQuery, state: FSMContext):
+    await state.set_state(AddProd.title); await state.update_data(cat=c.data.split(":", 1)[1]); await c.answer()
+    await c.message.answer("اسم محصول را بفرستید (مثلا: گیفت ۵۰ ستاره‌ای).\nانصراف: /cancel")
+
+@ar.message(AddProd.title, F.text)
+async def pnew_title(m: Message, state: FSMContext):
+    t = m.text.strip()
+    if not (2 <= len(t) <= 60): return await m.answer("اسم باید بین ۲ تا ۶۰ حرف باشد.")
+    await state.update_data(title=t); await state.set_state(AddProd.price)
+    await m.answer("قیمت را به تومان بفرستید (فقط عدد):")
+
+@ar.message(AddProd.price, F.text)
+async def pnew_price(m: Message, state: FSMContext):
+    v = norm(m.text)
+    if not v.isdigit() or int(v) <= 0: return await m.answer("یک عدد معتبر (تومان) بفرستید.")
+    await state.update_data(price=int(v)); await state.set_state(AddProd.target)
+    await m.answer("یوزرنیم گیرنده از کاربر پرسیده شود؟", reply_markup=ikb([[btn("✅ بله", "pt:1"), btn("❌ نه", "pt:0")]]))
+
+@ar.callback_query(AddProd.target, F.data.startswith("pt:"))
+async def pnew_target(c: CallbackQuery, state: FSMContext):
+    d = await state.get_data()
+    pid, _ = await execute("INSERT INTO products(category,title,price_toman,needs_target,active,created) VALUES(?,?,?,?,1,?)",
+                           (d["cat"], d["title"], d["price"], int(c.data.split(":")[1]), now()))
+    await state.clear(); await c.answer("✅ اضافه شد")
+    await render_prod(c.message, pid, edit=False)
+
+# ── مدیریت محصول ──
+async def render_prod(msg, pid, edit=True):
+    p = await fetchone("SELECT * FROM products WHERE id=?", (pid,))
+    if not p: return await msg.answer("محصول پیدا نشد.")
+    text = (f"📦 <b>#{p['id']} {esc(p['title'])}</b>\n💰 قیمت: {fm(p['price_toman'])} تومان\n"
+            f"🗂 دسته: {esc(await cat_title(p['category']))}\n"
+            f"👤 یوزرنیم گیرنده: {'می‌پرسد' if p['needs_target'] else 'نمی‌پرسد'}\n"
+            f"🔥 تخفیف ویژه: {p['sale_pct'] or 0:g}٪\nوضعیت: {'✅ موجود' if p['active'] else '⛔ ناموجود'}")
+    kb = ikb([[btn("💰 تغییر قیمت", f"pe:{pid}"), btn("🔥 تخفیف", f"ps:{pid}")],
+              [btn("⛔ ناموجود کن" if p["active"] else "✅ موجود کن", f"pa:{pid}")],
+              [btn("🗑 حذف", f"pd:{pid}")], [btn("🔙 برگشت", f"catv:{p['category']}")]])
+    await show(msg, text, kb, edit)
+
+@ar.callback_query(F.data.startswith("pv:"))
+async def pv(c: CallbackQuery):
+    await c.answer(); await render_prod(c.message, int(c.data.split(":")[1]))
+
+@ar.callback_query(F.data.startswith("pa:"))
+async def pa(c: CallbackQuery):
+    pid = int(c.data.split(":")[1])
+    await execute("UPDATE products SET active=1-active WHERE id=?", (pid,))
+    await c.answer("انجام شد"); await render_prod(c.message, pid)
+
+@ar.callback_query(F.data.startswith("pd:"))
+async def pd(c: CallbackQuery):
+    pid = int(c.data.split(":")[1]); await c.answer()
+    await show(c.message, "مطمئنید این محصول حذف شود؟", ikb([[btn("🗑 بله، حذف شود", f"pdy:{pid}"), btn("❌ نه", f"pv:{pid}")]]), edit=True)
+
+@ar.callback_query(F.data.startswith("pdy:"))
+async def pdy(c: CallbackQuery):
+    pid = int(c.data.split(":")[1])
+    p = await fetchone("SELECT category FROM products WHERE id=?", (pid,))
+    await execute("DELETE FROM products WHERE id=?", (pid,))
+    await c.answer("🗑 حذف شد")
+    await render_cat(c.message, p["category"]) if p else await render_cats(c.message)
+
+@ar.callback_query(F.data.startswith("pe:"))
+async def pe(c: CallbackQuery, state: FSMContext):
+    await state.set_state(EditPrice.value); await state.update_data(pid=int(c.data.split(":")[1])); await c.answer()
+    await c.message.answer("قیمت جدید را به تومان بفرستید (فقط عدد).\nانصراف: /cancel")
+
+@ar.message(EditPrice.value, F.text)
+async def pe_value(m: Message, state: FSMContext):
+    v = norm(m.text)
+    if not v.isdigit() or int(v) <= 0: return await m.answer("یک عدد معتبر (تومان) بفرستید.")
+    pid = (await state.get_data())["pid"]
+    await execute("UPDATE products SET price_toman=? WHERE id=?", (int(v), pid)); await state.clear()
+    await render_prod(m, pid, edit=False)
+
+@ar.callback_query(F.data.startswith("ps:"))
+async def ps(c: CallbackQuery, state: FSMContext):
+    await state.set_state(ProdSale.value); await state.update_data(pid=int(c.data.split(":")[1])); await c.answer()
+    await c.message.answer("درصد تخفیف ویژه را بفرستید (۰ تا ۵۰؛ ۰ = خاموش).\nانصراف: /cancel")
+
+@ar.message(ProdSale.value, F.text)
+async def ps_value(m: Message, state: FSMContext):
+    try: pct = float(norm(m.text))
+    except Exception: return await m.answer("یک عدد معتبر بفرستید.")
+    if not (0 <= pct <= 50): return await m.answer("درصد باید بین ۰ تا ۵۰ باشد.")
+    pid = (await state.get_data())["pid"]
+    await execute("UPDATE products SET sale_pct=? WHERE id=?", (pct, pid)); await state.clear()
+    await render_prod(m, pid, edit=False)
+
+# ── همه محصولات ──
+@ar.callback_query(F.data == "ap:prods")
+async def ap_prods(c: CallbackQuery):
+    await c.answer()
+    rows = [[btn(f"{'✅' if p['active'] else '⛔'} #{p['id']} {p['title']} — {fm(p['price_toman'])}", f"pv:{p['id']}")]
+            for p in await fetchall("SELECT * FROM products ORDER BY id DESC LIMIT 60")]
+    rows.append([btn("🏠 پنل", "ap:home")])
+    await show(c.message, "📦 محصولات (برای مدیریت، یکی را بزنید):" if len(rows) > 1 else "هنوز محصولی اضافه نشده.", ikb(rows), edit=True)
+
+# ── موجودی محصولات اصلی ──
+async def render_stock(msg, edit=True):
+    rows = [[btn(f"{'✅' if await available(k) else '⛔'} {n}", f"st:{k}")] for k, n in BUILTIN.items()]
+    rows.append([btn("🏠 پنل", "ap:home")])
+    await show(msg, "هر کدام را بزنید تا «موجود/ناموجود» شود:", ikb(rows), edit)
+
+@ar.callback_query(F.data == "ap:stock")
+async def ap_stock(c: CallbackQuery):
+    await c.answer(); await render_stock(c.message)
+
+@ar.callback_query(F.data.startswith("st:"))
+async def st_toggle(c: CallbackQuery):
+    k = c.data.split(":")[1]
+    if k not in BUILTIN: return await c.answer()
+    await execute("UPDATE settings SET v=? WHERE k=?", ("0" if not await available(k) else "1", f"off_{k}"))
+    await c.answer("انجام شد"); await render_stock(c.message)
+
+# ── تخفیف ویژه ──
+@ar.callback_query(F.data == "ap:sale")
+async def ap_sale(c: CallbackQuery):
+    await c.answer()
+    cur = ", ".join([f"{n} {await sget('sale_pct_' + n)}٪" for n in ("ton", "stars", "prem")])
+    await show(c.message, f"🔥 تخفیف ویژه روی قیمت\nفعلی: {cur}\n\nروی کدام اعمال شود؟ (برای تخفیف یک محصول خاص، از مدیریت همان محصول استفاده کنید)",
+               ikb([[btn("تون", "sl:ton"), btn("استارز", "sl:stars"), btn("پرمیوم", "sl:prem")],
+                    [btn("همه محصولات", "sl:all")], [btn("🏠 پنل", "ap:home")]]), edit=True)
+
+@ar.callback_query(F.data.startswith("sl:"))
+async def sl_pick(c: CallbackQuery, state: FSMContext):
+    await state.set_state(SaleAll.value); await state.update_data(t=c.data.split(":")[1]); await c.answer()
+    await c.message.answer("درصد تخفیف را بفرستید (۰ تا ۵۰؛ ۰ = خاموش).\nانصراف: /cancel")
+
+@ar.message(SaleAll.value, F.text)
+async def sl_value(m: Message, state: FSMContext):
+    try: pct = float(norm(m.text))
+    except Exception: return await m.answer("یک عدد معتبر بفرستید.")
+    if not (0 <= pct <= 50): return await m.answer("درصد باید بین ۰ تا ۵۰ باشد.")
+    t = (await state.get_data())["t"]; await state.clear()
+    await apply_sale(t, pct)
+    await m.answer(f"✅ تخفیف ویژه {t}: {pct:g}٪" if pct else f"✅ تخفیف {t} خاموش شد.", reply_markup=PANEL_KB)
+
+# ── ارسال منوی جدید به کاربران ──
+@ar.callback_query(F.data == "ap:push")
+async def ap_push(c: CallbackQuery):
+    await c.answer("در حال ارسال...")
+    kb = await main_menu(); ok = 0
+    for r in await fetchall("SELECT id FROM users WHERE banned=0 AND phone IS NOT NULL"):
+        try: await user_bot.send_message(r["id"], "🔄 منوی ربات به‌روز شد.", reply_markup=kb); ok += 1
+        except Exception: pass
+        await asyncio.sleep(0.05)
+    await c.message.answer(f"✅ منوی جدید برای {ok} کاربر ارسال شد.")
 
 # ═════════════════════════ MAIN ═════════════════════════
 async def main():
