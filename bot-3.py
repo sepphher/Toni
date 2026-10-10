@@ -1,4 +1,4 @@
-import asyncio, html, io, json, logging, math, os, re, shutil, sqlite3, time
+import asyncio, html, io, json, logging, math, os, re, shutil, sqlite3, time, unicodedata
 from datetime import datetime
 
 import aiohttp, aiosqlite
@@ -51,11 +51,15 @@ DEFAULTS = {
     "ton_fee_pct_hi": "2.5",       # بالاتر از ton_hi_threshold
     "ton_mid_threshold": "1.5", "ton_hi_threshold": "10",
     "ton_net_fee_ton": "0.01",     # کارمزد واقعی شبکه برای هر انتقال تون (TON) - هم خرید هم برداشت
-    "ton_min": "0.5",
-    "wd_min_ton": "0.5",
     "kyc_limit": "400000",         # سقف مجموع خرید بدون احراز هویت (تومان)
+    "ton_source": "channel",       # منبع قیمت دلاری تون: channel (کانال) یا binance
+    "ton_toman_manual": "0",       # اگه >0 باشه قیمت بازار هر تون (تومان) دستیه و از دلار حساب نمیشه
     "usdt_toman_manual": "0",      # اگر >0 باشه به جای نوبیتکس استفاده میشه
     "order_ttl_min": "15",
+    "disc_pct_ton": "0.5",         # درصد تخفیف (کش‌بک) روی هر خرید تون
+    "disc_pct_stars": "0.5",       # استارز (فقط از star_free_below به بالا؛ زیرش سود صفره پس تخفیف هم صفره)
+    "disc_pct_prem": "0.5",        # پرمیوم
+    "topup_min": "10000",          # حداقل شارژ ریالی (تومان)
 }
 
 SCHEMA = """
@@ -70,6 +74,7 @@ CREATE TABLE IF NOT EXISTS kyc(id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INT
   status TEXT, created REAL);
 CREATE TABLE IF NOT EXISTS settings(k TEXT PRIMARY KEY, v TEXT);
 CREATE TABLE IF NOT EXISTS support(chat_id INTEGER, msg_id INTEGER, user_id INTEGER, PRIMARY KEY(chat_id,msg_id));
+CREATE TABLE IF NOT EXISTS discounts(id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER, amount INTEGER, reason TEXT, created REAL);
 CREATE UNIQUE INDEX IF NOT EXISTS ux_track ON orders(tracking) WHERE tracking IS NOT NULL AND status IN ('pending','approved');
 """
 
@@ -80,6 +85,16 @@ async def init_db():
     db.row_factory = aiosqlite.Row
     await db.execute("PRAGMA journal_mode=WAL")
     await db.executescript(SCHEMA)
+    for table, col, ddl in [("users", "toman_balance", "INTEGER DEFAULT 0"),
+                            ("users", "discount_balance", "INTEGER DEFAULT 0"),
+                            ("orders", "discount", "INTEGER DEFAULT 0"),
+                            ("orders", "paid_wallet", "INTEGER DEFAULT 0"),
+                            ("orders", "paid_discount", "INTEGER DEFAULT 0"),
+                            ("orders", "card_toman", "INTEGER")]:
+        async with db.execute(f"PRAGMA table_info({table})") as cur:
+            have = {r["name"] for r in await cur.fetchall()}
+        if col not in have:
+            await db.execute(f"ALTER TABLE {table} ADD COLUMN {col} {ddl}")
     for k, v in DEFAULTS.items():
         await db.execute("INSERT OR IGNORE INTO settings(k,v) VALUES(?,?)", (k, v))
     await db.commit()
@@ -120,7 +135,61 @@ def num(s):
 def ts_fmt(t): return datetime.fromtimestamp(t).strftime("%Y/%m/%d %H:%M")
 
 # ───────────────────────── prices ─────────────────────────
-P = {"ton_usdt": 0.0, "usdt_toman": 0.0, "ts": 0.0}
+P = {"ton_usdt": 0.0, "usdt_toman": 0.0, "ts": 0.0,
+     "usdt_toman_chan": 0.0, "ton_toman_chan": 0.0, "ton_usd_chan": 0.0, "chan_ts": 0.0}
+TBL = {"stars": {}, "prem": {}, "ts": 0.0, "tried": 0.0}   # جدول قیمت استارز/پرمیوم کانال (تومان)
+CHANNEL_URL = os.getenv("PRICE_CHANNEL_URL", "https://t.me/s/TonPriceIran")
+
+def parse_channel(page: str):
+    """از پیش‌نمایش عمومی کانال TonPriceIran: تون، تتر، و جدول استارز/پرمیوم (آخرین مورد صفحه = جدیدترین)."""
+    t = re.sub(r"<br\s*/?>", "\n", page)
+    t = re.sub(r"<[^>]+>", " ", t)
+    t = unicodedata.normalize("NFKC", html.unescape(t))      # ارقام بولد ریاضی (𝟭𝟰) -> 14
+    t = re.sub("[\u200b-\u200f\u202a-\u202e]", "", t)
+    out = {}
+    num_ = lambda x: float(x.replace(",", ""))
+    m = re.findall(r"گرام\s*\(GRAM\)\s*:\D*?([\d.]+)\s*USD\s*\|\D*?([\d,]+)\s*تومان", t)
+    if m: out["ton_usd"], out["ton_toman"] = float(m[-1][0]), num_(m[-1][1])
+    m = re.findall(r"تتر\s*\(USDT\)\s*:\D*?([\d.]+)\s*USD\s*\|\D*?([\d,]+)\s*تومان", t)
+    if m: out["usdt_toman"] = num_(m[-1][1])
+    out["prem"] = {int(a): num_(b) for a, b in re.findall(r"(\d+)\s*ماهه\s*≈\s*([\d,]+)\s*تومان", t)}
+    out["stars"] = {int(a): num_(b) for a, b in re.findall(r"(\d+)\s*ستاره\s*≈\s*([\d,]+)\s*تومان", t)}
+    ids = [int(x) for x in re.findall(r"TonPriceIran/(\d+)", page)]
+    out["min_id"] = min(ids) if ids else 0
+    return out
+
+def _apply_tbl(d):
+    if d.get("stars") and d.get("prem"):
+        TBL["stars"], TBL["prem"], TBL["ts"] = d["stars"], d["prem"], time.time()
+
+async def channel_loop():
+    """هر ۵ دقیقه: تون و تتر. جدول استارز/پرمیوم کانال هر ۴ ساعت میاد؛ اگه تو صفحه‌ی آخر نبود چند صفحه عقب‌تر رو می‌گرده."""
+    while True:
+        try:
+            async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=15),
+                                             headers={"User-Agent": "Mozilla/5.0"}) as sess:
+                async def get(url):
+                    async with sess.get(url) as r: return await r.text()
+                d = parse_channel(await get(CHANNEL_URL))
+                if 10000 <= d.get("usdt_toman", 0) <= 1000000 and d.get("ton_toman", 0) > 0:
+                    P.update(usdt_toman_chan=d["usdt_toman"], ton_toman_chan=d["ton_toman"],
+                             ton_usd_chan=d.get("ton_usd", 0.0), chan_ts=time.time())
+                    log.info("channel: usdt=%s ton=%s", d["usdt_toman"], d["ton_toman"])
+                else:
+                    log.warning("channel: ton/usdt not found")
+                _apply_tbl(d)
+                if not TBL["prem"] and time.time() - TBL["tried"] > 1800 or \
+                        (time.time() - TBL["ts"] > 5 * 3600 and time.time() - TBL["tried"] > 1800):
+                    TBL["tried"] = time.time()
+                    for _ in range(6):
+                        if not d.get("min_id"): break
+                        d = parse_channel(await get(f"{CHANNEL_URL}?before={d['min_id']}"))
+                        _apply_tbl(d)
+                        if time.time() - TBL["ts"] < 60: break
+                    log.info("channel table: stars=%s prem=%s", TBL["stars"], TBL["prem"])
+        except Exception as e:
+            log.warning("channel fetch failed: %s", e)
+        await asyncio.sleep(300)
 
 async def price_loop():
     while True:
@@ -128,101 +197,35 @@ async def price_loop():
             async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=10)) as s:
                 async with s.get("https://api.binance.com/api/v3/ticker/price?symbol=TONUSDT") as r:
                     P["ton_usdt"] = float((await r.json())["price"])
+                P["ts"] = time.time()
                 try:
                     async with s.get("https://api.nobitex.ir/v3/orderbook/USDTIRT") as r:
                         P["usdt_toman"] = float((await r.json())["lastTradePrice"]) / 10
                 except Exception as e:
                     log.warning("nobitex failed: %s", e)
-                P["ts"] = time.time()
-                log.info("prices: %s", P)
         except Exception as e:
             log.warning("price update failed: %s", e)
         await asyncio.sleep(180)
 
-
-# ── قیمت خرید خودکار از فراگمنت (بدون API رسمی؛ اسکرپ) ──
-FRAG_UA = {"User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/124 Safari/537.36",
-           "X-Requested-With": "XMLHttpRequest"}
-FRAG = {"ts": 0.0, "alerted": False, "last": "هنوز اجرا نشده"}
-TAG = re.compile(r"<[^>]+>")
-
-def _flat(txt):
-    try:
-        out = []
-        def walk(x):
-            if isinstance(x, dict): [walk(v) for v in x.values()]
-            elif isinstance(x, list): [walk(v) for v in x]
-            elif isinstance(x, str): out.append(x)
-        walk(json.loads(txt)); txt = " ".join(out)
-    except Exception:
-        pass
-    return html.unescape(TAG.sub(" ", txt))
-
-async def _frag_stars_ton(s):
-    async with s.get("https://fragment.com/stars/buy", headers=FRAG_UA) as r:
-        page = await r.text()
-    m = re.search(r'apiUrl"\s*:\s*"([^"]+)"', page)
-    if not m: raise ValueError("apiUrl پیدا نشد")
-    url = "https://fragment.com" + m.group(1).replace("\\/", "/")
-    async with s.post(url, data={"mode": "new", "quantity": "50", "method": "updateStarsPrices"}, headers=FRAG_UA) as r:
-        txt = _flat(await r.text())
-    m = re.search(r"([\d]+(?:[.,]\d+)?)\s*TON", txt)
-    if not m: raise ValueError("قیمت TON در پاسخ نبود: " + txt[:150])
-    return float(m.group(1).replace(",", "."))
-
-async def _frag_premium_ton(s):
-    async with s.get("https://fragment.com/premium/gift", headers=FRAG_UA) as r:
-        txt = _flat(await r.text())
-    res = {}
-    for mo in (3, 6, 12):
-        m = re.search(rf"\b{mo}\s*months?\b[^\d]{{0,60}}?([\d]+(?:[.,]\d+)?)\s*TON", txt, re.I)
-        if m: res[mo] = float(m.group(1).replace(",", "."))
-    if len(res) < 3: raise ValueError("قیمت پرمیوم پیدا نشد")
-    return res
-
-async def update_fragment_prices():
-    """قیمت‌ها رو از فراگمنت می‌گیره، با تون→دلار تبدیل می‌کنه و فقط اگه منطقی بود ذخیره می‌کنه."""
-    if P["ton_usdt"] <= 0: return "قیمت تون هنوز نیومده"
-    report, errors = [], []
-    async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=20)) as s:
-        try:
-            usd = await _frag_stars_ton(s) * P["ton_usdt"]
-            if not 0.5 <= usd <= 2.0: raise ValueError(f"قیمت غیرمنطقی برای ۵۰ استارز: {usd:.3f}$")
-            await execute("UPDATE settings SET v=? WHERE k='star_gift50_usd'", (f"{usd:.4f}",))
-            report.append(f"⭐ گیفت ۵۰تایی: {usd:.3f}$")
-        except Exception as e:
-            errors.append(f"استارز: {e}")
-        try:
-            bounds = {3: (5, 30), 6: (8, 45), 12: (15, 80)}
-            for mo, ton in (await _frag_premium_ton(s)).items():
-                usd = ton * P["ton_usdt"]
-                if not bounds[mo][0] <= usd <= bounds[mo][1]: raise ValueError(f"قیمت غیرمنطقی پرمیوم {mo} ماهه: {usd:.2f}$")
-            for mo, ton in (await _frag_premium_ton(s)).items():
-                await execute("UPDATE settings SET v=? WHERE k=?", (f"{ton * P['ton_usdt']:.3f}", f"premium_usd_{mo}"))
-            report.append("💎 پرمیوم بروز شد")
-        except Exception as e:
-            errors.append(f"پرمیوم: {e}")
-    if report: FRAG["ts"] = time.time(); FRAG["alerted"] = False
-    if errors and not FRAG["alerted"]:
-        FRAG["alerted"] = True
-        await to_admins("⚠️ دریافت خودکار قیمت فراگمنت ناموفق بود؛ از آخرین قیمت ذخیره‌شده استفاده میشه.\n" + "\n".join(errors) +
-                        "\nدستی: /set star_gift50_usd و /set premium_usd_3 ...")
-    FRAG["last"] = "\n".join(report + ["❌ " + e for e in errors])
-    return FRAG["last"]
-
-async def fragment_loop():
-    while P["ton_usdt"] <= 0: await asyncio.sleep(5)
-    while True:
-        try: await update_fragment_prices()
-        except Exception as e: log.warning("fragment loop: %s", e)
-        await asyncio.sleep(600)
-
 async def usdt_toman():
+    """اولویت: نرخ دستی (/setrate) > کانال TonPriceIran > نوبیتکس"""
     man = await sf("usdt_toman_manual")
-    return man if man > 0 else P["usdt_toman"]
+    if man > 0: return man
+    if P["usdt_toman_chan"] > 0 and time.time() - P["chan_ts"] < 7200: return P["usdt_toman_chan"]
+    return P["usdt_toman"]
+
+async def ton_base():
+    """قیمت بازار هر تون به تومان (بدون سود): دستی > کانال (مستقیم به تومان) > بایننس × تتر"""
+    man = await sf("ton_toman_manual")
+    if man > 0: return man
+    chan = P["ton_toman_chan"] if P["ton_toman_chan"] > 0 and time.time() - P["chan_ts"] < 7200 else 0.0
+    ut = await usdt_toman()
+    binance = P["ton_usdt"] * ut if P["ton_usdt"] > 0 and ut > 0 and time.time() - P["ts"] < 900 else 0.0
+    first, second = (chan, binance) if await sget("ton_source") == "channel" else (binance, chan)
+    return first or second
 
 async def price_ready():
-    return P["ton_usdt"] > 0 and (await usdt_toman()) > 0 and time.time() - P["ts"] < 900
+    return await ton_base() > 0 and await usdt_toman() > 0
 
 async def ton_margin(ton):
     if ton > await sf("ton_hi_threshold"): return await sf("ton_fee_pct_hi")
@@ -231,14 +234,14 @@ async def ton_margin(ton):
 
 async def ton_quote(ton=None, toman=None):
     """قیمت تون = قیمت بازار (بدون سود). سود شما داخل «کارمزد» میاد: کارمزد = هزینه واقعی انتقال + درصد."""
-    base = P["ton_usdt"] * await usdt_toman()
+    base = await ton_base()
     net = int(round(await sf("ton_net_fee_ton") * base / 100) * 100)   # هزینه واقعی انتقال
     if ton is None:
         t = max(toman - net, 0) / base
         for _ in range(3):
             m = await ton_margin(t)
             t = max(toman - net, 0) / (base * (1 + m / 100))
-        ton = math.floor(t * 100) / 100
+        ton = math.floor(t * 1000) / 1000
     m = await ton_margin(ton)
     price = round_to(ton * base)
     fee = int(round((net + ton * base * m / 100) / 100) * 100)
@@ -306,10 +309,15 @@ async def frag_loop():
             log.warning("fragment loop: %s", e)
         await asyncio.sleep(300)
 
+def tbl_fresh():
+    return TBL["ts"] > 0 and time.time() - TBL["ts"] < 86400
+
 async def stars_unit_toman():
+    if tbl_fresh() and TBL["stars"]:                    # قیمت کانال (دلار فراگمنت × تتر)
+        k = max(TBL["stars"]); return TBL["stars"][k] / k
     ton_price = frag_get("stars50")
-    if ton_price:
-        return ton_price / 50 * P["ton_usdt"] * await usdt_toman()
+    if ton_price and await ton_base() > 0:
+        return ton_price / 50 * await ton_base()
     return await sf("star_gift50_usd") / 50 * await usdt_toman()
 
 async def stars_price(n):
@@ -317,8 +325,11 @@ async def stars_price(n):
     return round_to(n * await stars_unit_toman() * (1 + m / 100))
 
 async def premium_price(months):
-    ton_price = frag_get(f"prem{months}")
-    cost = ton_price * P["ton_usdt"] * await usdt_toman() if ton_price else await sf(f"premium_usd_{months}") * await usdt_toman()
+    if tbl_fresh() and TBL["prem"].get(months):
+        cost = TBL["prem"][months]
+    else:
+        ton_price = frag_get(f"prem{months}")
+        cost = ton_price * await ton_base() if ton_price and await ton_base() > 0 else await sf(f"premium_usd_{months}") * await usdt_toman()
     return round_to(cost * (1 + await sf("premium_margin") / 100))
 
 # ───────────────────────── notify helpers ─────────────────────────
@@ -372,10 +383,11 @@ class Pay(StatesGroup): receipt = State(); tracking = State()
 class Kyc(StatesGroup): card = State(); photo = State()
 class Wd(StatesGroup): amount = State(); address = State(); memo = State(); confirm = State()
 class Support(StatesGroup): msg = State()
+class Topup(StatesGroup): amount = State()
 
 MENU = ReplyKeyboardMarkup(resize_keyboard=True, keyboard=[
     [KeyboardButton(text="🛒 خرید تون"), KeyboardButton(text="⭐ خرید استارز")],
-    [KeyboardButton(text="💎 تلگرام پرمیوم"), KeyboardButton(text="👛 کیف پول")],
+    [KeyboardButton(text="💎 تلگرام پرمیوم"), KeyboardButton(text="👤 حساب من")],
     [KeyboardButton(text="📜 تاریخچه"), KeyboardButton(text="💸 برداشت")],
     [KeyboardButton(text="🆘 پشتیبانی")]])
 
@@ -442,13 +454,60 @@ async def buy_prem(m: Message, state: FSMContext):
                                           callback_data=f"prem:{mo}")])
     await m.answer("پلن پرمیوم را انتخاب کنید:", reply_markup=InlineKeyboardMarkup(inline_keyboard=rows))
 
-@ur.message(F.text == "👛 کیف پول")
-async def wallet(m: Message, state: FSMContext):
+async def card_used(uid):
+    r = await fetchone("SELECT COALESCE(SUM(COALESCE(card_toman,toman)),0) s FROM orders "
+                       "WHERE user_id=? AND status IN ('pending','approved')", (uid,))
+    return r["s"]
+
+@ur.message(F.text == "👤 حساب من")
+async def account(m: Message, state: FSMContext):
     await state.clear()
     if not await phone_ok(m): return
     u = await get_user(m.from_user.id)
-    await m.answer(f"👛 موجودی شما: <b>{u['ton_nano'] / NANO:.4f}</b> TON\n"
-                   f"🪪 احراز هویت: {'✅ تایید شده' if u['kyc'] else '❌ انجام نشده'}")
+    limit = int(await sf("kyc_limit")); used = await card_used(m.from_user.id)
+    if u["kyc"]:
+        kyc = "✅ تایید شده (بدون سقف)"
+    else:
+        kyc = f"❌ انجام نشده\n   سقف باقی‌مانده بدون احراز: {fm(max(limit - used, 0))} از {fm(limit)} تومان"
+    buys = await fetchone("SELECT COALESCE(SUM(toman),0) s, COUNT(*) c FROM orders WHERE user_id=? AND status='approved' AND kind!='topup'", (m.from_user.id,))
+    rows = [[InlineKeyboardButton(text="➕ شارژ کیف پول ریالی", callback_data="acc:topup")],
+            [InlineKeyboardButton(text="🎁 تخفیف‌های من", callback_data="acc:disc")]]
+    if not u["kyc"]:
+        rows.append([InlineKeyboardButton(text="🪪 احراز هویت", callback_data="acc:kyc")])
+    await m.answer(f"👤 <b>حساب من</b>\n\n📱 {esc(u['phone'])}\n🪪 احراز هویت: {kyc}\n\n"
+                   f"💎 موجودی تون: <b>{u['ton_nano'] / NANO:.4f}</b> TON\n"
+                   f"💵 موجودی ریالی: <b>{fm(u['toman_balance'] or 0)}</b> تومان\n"
+                   f"🎁 تخفیف‌ها: <b>{fm(u['discount_balance'] or 0)}</b> تومان\n\n"
+                   f"🛍 خریدهای تاییدشده: {buys['c']} عدد، مجموع {fm(buys['s'])} تومان\n\n"
+                   "💡 موجودی ریالی و تخفیف‌ها در خرید بعدی خودکار از مبلغ کسر می‌شوند.",
+                   reply_markup=InlineKeyboardMarkup(inline_keyboard=rows))
+
+@ur.callback_query(F.data == "acc:topup")
+async def acc_topup(c: CallbackQuery, state: FSMContext):
+    await c.answer(); await state.set_state(Topup.amount)
+    await c.message.answer(f"مبلغ شارژ را به تومان بنویسید (حداقل {fm(await sf('topup_min'))}):")
+
+@ur.message(Topup.amount, F.text)
+async def topup_amount(m: Message, state: FSMContext):
+    v = num(m.text)
+    if not v or v != int(v): return await m.answer("یک عدد معتبر (تومان) وارد کنید.")
+    if v < await sf("topup_min"): return await m.answer(f"حداقل شارژ {fm(await sf('topup_min'))} تومان است.")
+    await show_confirm(m, state, "topup", {"amount": int(v)})
+
+@ur.callback_query(F.data == "acc:kyc")
+async def acc_kyc(c: CallbackQuery, state: FSMContext):
+    await c.answer(); await state.set_state(Kyc.card)
+    await c.message.answer("🪪 شماره‌ی ۱۶ رقمی کارت بانکی خود را بفرستید:")
+
+@ur.callback_query(F.data == "acc:disc")
+async def acc_disc(c: CallbackQuery):
+    await c.answer()
+    u = await get_user(c.from_user.id)
+    rows = await fetchall("SELECT * FROM discounts WHERE user_id=? ORDER BY id DESC LIMIT 10", (c.from_user.id,))
+    lines = [f"{'➕' if r['amount'] > 0 else '➖'} {fm(abs(r['amount']))} تومان — {esc(r['reason'])}\n   {ts_fmt(r['created'])}" for r in rows]
+    await c.message.answer(f"🎁 <b>تخفیف‌های من</b>\n\nموجودی: <b>{fm(u['discount_balance'] or 0)}</b> تومان\n"
+                           "از هر خرید بخشی به‌صورت تخفیف به اینجا اضافه می‌شود و در خرید بعدی خودکار کسر می‌شود.\n\n"
+                           + ("\n".join(lines) if lines else "هنوز تخفیفی ندارید."))
 
 @ur.message(F.text == "📜 تاریخچه")
 async def history(m: Message, state: FSMContext):
@@ -476,9 +535,9 @@ async def wd_start(m: Message, state: FSMContext):
     await state.clear()
     if not await phone_ok(m): return
     u = await get_user(m.from_user.id)
-    mn = await sf("wd_min_ton")
-    if u["ton_nano"] / NANO < mn:
-        return await m.answer(f"موجودی شما کافی نیست. حداقل برداشت {mn} TON است.")
+    fee = await sf("ton_net_fee_ton")
+    if u["ton_nano"] / NANO <= fee:
+        return await m.answer(f"موجودی شما کافی نیست. کارمزد انتقال {fee} TON است.")
     kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="💯 برداشت کل موجودی", callback_data="wd:all")]])
     await state.set_state(Wd.amount)
     await m.answer(f"موجودی: <b>{u['ton_nano'] / NANO:.4f}</b> TON\nکارمزد برداشت: {await sf('ton_net_fee_ton')} TON\n"
@@ -497,10 +556,30 @@ async def support_msg(m: Message, state: FSMContext):
     await m.answer("✅ پیام شما ارسال شد. پاسخ از همین ربات به شما می‌رسد.")
 
 # ── build pending purchase ──
+async def calc_discount(kind, toman, p):
+    key = {"ton": "disc_pct_ton", "stars": "disc_pct_stars", "prem": "disc_pct_prem"}.get(kind)
+    if not key: return 0
+    if kind == "stars" and p["count"] < await sf("star_free_below"): return 0   # زیر آستانه سود صفره
+    return int(round(toman * await sf(key) / 100 / 100) * 100)
+
 async def build(kind, p):
+    pend = await _build(kind, p)
+    if not pend: return None
+    pend["discount"] = await calc_discount(kind, pend["toman"], p)
+    if pend["discount"] > 0:
+        pend["text"] += (f"\n\n🎁 با این خرید <b>{fm(pend['discount'])}</b> تومان تخفیف می‌گیرید "
+                         "(بعد از تایید به کیف پول شما، بخش تخفیف‌ها، اضافه می‌شود)")
+    return pend
+
+async def _build(kind, p):
+    if kind == "topup":
+        a = int(p["amount"])
+        text = (f"🧾 <b>شارژ کیف پول ریالی</b>\n\n💵 مبلغ: <b>{fm(a)}</b> تومان\n"
+                f"━━━━━━━━\n💳 مبلغ قابل واریز: <b>{fm(a)}</b> تومان")
+        return dict(kind="topup", title="شارژ کیف پول", details={}, toman=a, nano=0, text=text, ts=now())
     if kind == "ton":
         q = await ton_quote(**p["q"])
-        if q["ton"] < await sf("ton_min"):
+        if q["ton"] <= 0:
             return None
         text = (f"🧾 <b>پیش‌فاکتور</b>\n\n💎 مقدار: <b>{q['ton']}</b> TON\n"
                 f"💱 نرخ هر تون: {fm(q['rate'])} تومان\n"
@@ -528,7 +607,7 @@ CONFIRM_KB = InlineKeyboardMarkup(inline_keyboard=[[
 async def show_confirm(msg: Message, state: FSMContext, kind, params):
     pend = await build(kind, params)
     if not pend:
-        return await msg.answer(f"حداقل خرید تون {await sf('ton_min')} است.")
+        return await msg.answer("مقدار یا مبلغ خیلی کم است، عدد بزرگ‌تری وارد کنید.")
     await state.set_state(None)
     await state.update_data(kind=kind, params=params, pending=pend)
     await msg.answer(pend["text"], reply_markup=CONFIRM_KB)
@@ -601,23 +680,68 @@ async def co_ok(c: CallbackQuery, state: FSMContext):
 
 async def place_order(msg: Message, state: FSMContext, uid, pend):
     u = await get_user(uid)
-    if not u["kyc"]:
-        used = await fetchone("SELECT COALESCE(SUM(toman),0) s FROM orders WHERE user_id=? AND status IN ('pending','approved')", (uid,))
+    total = pend["toman"]
+    use_d = use_w = 0
+    if pend["kind"] != "topup":                       # تخفیف‌ها و موجودی ریالی خودکار کسر میشن
+        use_d = min(u["discount_balance"] or 0, total)
+        use_w = min(u["toman_balance"] or 0, total - use_d)
+    card = total - use_d - use_w
+    if not u["kyc"] and card > 0:                     # فقط مبلغ کارتی در سقف احراز هویت حساب میشه
         limit = int(await sf("kyc_limit"))
-        if used["s"] + pend["toman"] > limit:
+        if await card_used(uid) + card > limit:
             await state.set_state(Kyc.card)
             return await msg.answer(f"🪪 برای خرید بیش از {fm(limit)} تومان (مجموع) احراز هویت لازم است.\n"
                                     "ابتدا شماره‌ی ۱۶ رقمی کارت بانکی خود را بفرستید:")
     await execute("UPDATE orders SET status='cancelled' WHERE user_id=? AND status='awaiting'", (uid,))
     ttl = int(await sf("order_ttl_min"))
-    oid, _ = await execute("INSERT INTO orders(user_id,kind,title,details,toman,ton_nano,status,created,expires) "
-                           "VALUES(?,?,?,?,?,?,'awaiting',?,?)",
-                           (uid, pend["kind"], pend["title"], json.dumps(pend["details"]), pend["toman"],
-                            pend["nano"], now(), now() + ttl * 60))
+    oid, _ = await execute("INSERT INTO orders(user_id,kind,title,details,toman,ton_nano,status,created,expires,"
+                           "discount,paid_wallet,paid_discount,card_toman) VALUES(?,?,?,?,?,?,'awaiting',?,?,?,?,?,?)",
+                           (uid, pend["kind"], pend["title"], json.dumps(pend["details"]), total, pend["nano"],
+                            now(), now() + ttl * 60, pend.get("discount", 0), use_w, use_d, card))
+    if card == 0:                                     # کاملا از موجودی پرداخت میشه
+        r = await submit_order(oid)
+        await state.clear()
+        if r == "ok":
+            return await msg.answer("✅ سفارش شما از موجودی کیف پول ثبت و برای بررسی ارسال شد.", reply_markup=MENU)
+        return await msg.answer("موجودی شما تغییر کرده، لطفا دوباره سفارش بدهید.")
     await state.set_state(Pay.receipt); await state.update_data(order_id=oid)
-    await msg.answer(f"💳 مبلغ <b>{fm(pend['toman'])}</b> تومان را تا <b>{ttl} دقیقه</b> آینده به کارت زیر واریز کنید:\n\n"
+    lines = [f"💰 مبلغ سفارش: {fm(total)} تومان"]
+    if use_d: lines.append(f"🎁 کسر از تخفیف‌ها: -{fm(use_d)}")
+    if use_w: lines.append(f"💵 کسر از موجودی ریالی: -{fm(use_w)}")
+    await msg.answer("\n".join(lines) + f"\n\n💳 مبلغ <b>{fm(card)}</b> تومان را تا <b>{ttl} دقیقه</b> آینده به کارت زیر واریز کنید:\n\n"
                      f"<code>{CARD_NUMBER}</code>\nبه نام: <b>{esc(CARD_OWNER)}</b>\n\n"
                      "📸 بعد از واریز، <b>عکس فیش</b> را همینجا بفرستید.")
+
+async def submit_order(oid, photo=None, code=None, ruid=None):
+    """کسر موجودی‌ها (اتمیک) + ثبت سفارش و ارسال برای ادمین. خروجی: ok / expired / balance"""
+    o = await fetchone("SELECT * FROM orders WHERE id=?", (oid,))
+    if not o or o["status"] != "awaiting": return "expired"
+    uid = o["user_id"]
+    if o["paid_discount"]:
+        _, rc = await execute("UPDATE users SET discount_balance=discount_balance-? WHERE id=? AND discount_balance>=?",
+                              (o["paid_discount"], uid, o["paid_discount"]))
+        if not rc: return "balance"
+    if o["paid_wallet"]:
+        _, rc = await execute("UPDATE users SET toman_balance=toman_balance-? WHERE id=? AND toman_balance>=?",
+                              (o["paid_wallet"], uid, o["paid_wallet"]))
+        if not rc:
+            if o["paid_discount"]:
+                await execute("UPDATE users SET discount_balance=discount_balance+? WHERE id=?", (o["paid_discount"], uid))
+            return "balance"
+    if o["paid_discount"]:
+        await execute("INSERT INTO discounts(user_id,amount,reason,created) VALUES(?,?,?,?)",
+                      (uid, -o["paid_discount"], f"استفاده در سفارش #{oid}", now()))
+    await execute("UPDATE orders SET status='pending', tracking=?, receipt_uid=? WHERE id=?", (code, ruid, oid))
+    u = await get_user(uid); det = json.loads(o["details"])
+    extra = f"\n👤 آیدی تحویل: {esc(det['target'])}" if "target" in det else ""
+    pay = (f"💳 کارت: {fm(o['card_toman'])} | 💵 ریالی: {fm(o['paid_wallet'])} | 🎁 تخفیف: {fm(o['paid_discount'])}")
+    tail = f"🔖 کد پیگیری: <code>{esc(code)}</code>\n" if code else "✅ کامل از موجودی کیف پول پرداخت شده (بدون فیش)\n"
+    note = ("💵 بعد از تایید به موجودی ریالی کاربر اضافه میشه." if o["kind"] == "topup"
+            else "⚠️ برای استارز/پرمیوم اول تحویل بدید، بعد تایید بزنید.")
+    await to_admins(f"🛒 سفارش #{oid} ({esc(o['kind'])})\n📦 {esc(o['title'])}{extra}\n💰 {fm(o['toman'])} تومان\n{pay}\n"
+                    f"{tail}👤 کاربر: <code>{uid}</code> @{esc(u['username'] or '-')}\n📱 {esc(u['phone'])}\n\n{note}",
+                    kb_ok_no("ord", oid), photo)
+    return "ok"
 
 # ── KYC ──
 @ur.message(Kyc.card, F.text)
@@ -662,22 +786,19 @@ async def pay_tracking(m: Message, state: FSMContext):
         await state.clear(); return await m.answer("این سفارش منقضی یا لغو شده است. دوباره سفارش بدهید.")
     dup = await fetchone("SELECT id FROM orders WHERE (tracking=? OR receipt_uid=?) AND status IN ('pending','approved')", (code, data["uid"]))
     if dup: return await m.answer("⚠️ این فیش یا کد پیگیری قبلا ثبت شده است.")
-    await execute("UPDATE orders SET status='pending', tracking=?, receipt_uid=? WHERE id=?", (code, data["uid"], oid))
     buf = io.BytesIO(); await user_bot.download(data["file_id"], destination=buf)
-    u = await get_user(o["user_id"]); det = json.loads(o["details"])
-    extra = f"\n👤 آیدی تحویل: {esc(det['target'])}" if "target" in det else ""
-    await to_admins(f"🛒 سفارش #{oid} ({esc(o['kind'])})\n📦 {esc(o['title'])}{extra}\n💰 {fm(o['toman'])} تومان\n"
-                    f"🔖 کد پیگیری: <code>{esc(code)}</code>\n👤 کاربر: <code>{o['user_id']}</code> @{esc(u['username'] or '-')}\n"
-                    f"📱 {esc(u['phone'])}\n\n⚠️ برای استارز/پرمیوم اول تحویل بدید، بعد تایید بزنید.",
-                    kb_ok_no("ord", oid), BufferedInputFile(buf.getvalue(), "receipt.jpg"))
+    r = await submit_order(oid, BufferedInputFile(buf.getvalue(), "receipt.jpg"), code, data["uid"])
     await state.clear()
-    await m.answer("✅ فیش شما ثبت و برای بررسی ارسال شد. نتیجه به شما اطلاع داده می‌شود.", reply_markup=MENU)
+    if r == "ok":
+        return await m.answer("✅ فیش شما ثبت و برای بررسی ارسال شد. نتیجه به شما اطلاع داده می‌شود.", reply_markup=MENU)
+    if r == "balance":
+        return await m.answer("موجودی کیف پول/تخفیف شما در این فاصله تغییر کرده. لطفا سفارش را دوباره ثبت کنید.", reply_markup=MENU)
+    await m.answer("این سفارش منقضی یا لغو شده است. دوباره سفارش بدهید.", reply_markup=MENU)
 
 # ── withdraw ──
 async def wd_set_amount(msg: Message, state: FSMContext, uid, nano):
     u = await get_user(uid); fee = int(await sf("ton_net_fee_ton") * NANO)
     if nano > u["ton_nano"]: return await msg.answer("مقدار بیشتر از موجودی است.")
-    if nano / NANO < await sf("wd_min_ton"): return await msg.answer(f"حداقل برداشت {await sf('wd_min_ton')} TON است.")
     if nano <= fee: return await msg.answer("مقدار کمتر از کارمزد است.")
     await state.update_data(nano=nano, fee=fee); await state.set_state(Wd.address)
     await msg.answer("آدرس کیف پول تون (TON) مقصد را بفرستید:")
@@ -782,16 +903,35 @@ async def adm_order(c: CallbackQuery):
     _, rc = await execute("UPDATE orders SET status=? WHERE id=? AND status='pending'", (new, oid))
     if not rc: return await c.answer("قبلا بررسی شده.", show_alert=True)
     o = await fetchone("SELECT * FROM orders WHERE id=?", (oid,))
+    uid = o["user_id"]
     if act == "ok":
-        if o["kind"] == "ton":
-            await execute("UPDATE users SET ton_nano=ton_nano+? WHERE id=?", (o["ton_nano"], o["user_id"]))
-            await to_user(o["user_id"], f"✅ سفارش #{oid} تایید شد و {o['ton_nano'] / NANO} TON به کیف پولتان اضافه شد.")
+        if o["kind"] == "topup":
+            await execute("UPDATE users SET toman_balance=toman_balance+? WHERE id=?", (o["toman"], uid))
+            await to_user(uid, f"✅ شارژ {fm(o['toman'])} تومان به کیف پول ریالی شما اضافه شد.")
         else:
-            await to_user(o["user_id"], f"✅ سفارش #{oid} ({esc(o['title'])}) تایید و تحویل داده شد.")
-        await to_channel(f"✅ {esc(o['title'])} به قیمت {fm(o['toman'])} تومان تایید شد")
+            if o["kind"] == "ton":
+                await execute("UPDATE users SET ton_nano=ton_nano+? WHERE id=?", (o["ton_nano"], uid))
+                msg = f"✅ سفارش #{oid} تایید شد و {o['ton_nano'] / NANO} TON به کیف پولتان اضافه شد."
+            else:
+                msg = f"✅ سفارش #{oid} ({esc(o['title'])}) تایید و تحویل داده شد."
+            d = o["discount"] or 0
+            if d > 0:
+                await execute("UPDATE users SET discount_balance=discount_balance+? WHERE id=?", (d, uid))
+                await execute("INSERT INTO discounts(user_id,amount,reason,created) VALUES(?,?,?,?)",
+                              (uid, d, f"تخفیف خرید #{oid}", now()))
+                msg += f"\n🎁 {fm(d)} تومان تخفیف به کیف پول شما (بخش تخفیف‌ها) اضافه شد."
+            await to_user(uid, msg)
+            await to_channel(f"✅ {esc(o['title'])} به قیمت {fm(o['toman'])} تومان تایید شد")
         await done(c, f"✅ سفارش #{oid} تایید شد.")
     else:
-        await to_user(o["user_id"], f"❌ سفارش #{oid} رد شد. در صورت اشتباه با پشتیبانی تماس بگیرید.")
+        if o["paid_wallet"]:
+            await execute("UPDATE users SET toman_balance=toman_balance+? WHERE id=?", (o["paid_wallet"], uid))
+        if o["paid_discount"]:
+            await execute("UPDATE users SET discount_balance=discount_balance+? WHERE id=?", (o["paid_discount"], uid))
+            await execute("INSERT INTO discounts(user_id,amount,reason,created) VALUES(?,?,?,?)",
+                          (uid, o["paid_discount"], f"بازگشت از سفارش رد شده #{oid}", now()))
+        back = " موجودی و تخفیف استفاده‌شده به حساب شما برگشت." if (o["paid_wallet"] or o["paid_discount"]) else ""
+        await to_user(uid, f"❌ سفارش #{oid} رد شد.{back} در صورت اشتباه با پشتیبانی تماس بگیرید.")
         await done(c, f"❌ سفارش #{oid} رد شد.")
 
 @ar.callback_query(F.data.startswith("wd:"))
@@ -833,21 +973,31 @@ async def adm_support_reply(m: Message):
 @ar.message(CommandStart())
 async def adm_start(m: Message):
     await m.answer("پنل ادمین ✅\n/stats\n/fragment (بروزرسانی دستی قیمت فراگمنت)\n/prices\n/set key value\n/setrate تومان_هر_USDT (۰ = خودکار)\n"
-                   "/ban id\n/unban id\n/credit id مقدار_تون\n/broadcast متن")
+                   "/ban id\n/unban id\n/credit id مقدار_تون\n/creditrial id تومان (موجودی ریالی)\n/creditdisc id تومان (تخفیف)\n/broadcast متن")
 
 @ar.message(Command("prices"))
 async def adm_prices(m: Message):
     rows = [r for r in await fetchall("SELECT k,v FROM settings ORDER BY k") if r["k"] in DEFAULTS]
-    ut = await usdt_toman()
-    await m.answer(f"TON/USDT: {P['ton_usdt']}\nUSDT/تومان (فعال): {ut:,.0f}\n"
-                   f"💎 قیمت بازار هر تون (بدون سود): {P['ton_usdt'] * ut:,.0f} تومان\n"
-                   f"آخرین آپدیت: {ts_fmt(P['ts']) if P['ts'] else '-'}\n"
-                   f"فراگمنت (TON): " + (", ".join(f"{k}={v[0]}" for k, v in {**FRAG_PUB, **FRAG}.items()) or "دستی/غیرفعال") + "\n\n" + "\n".join(f"{r['k']} = {r['v']}" for r in rows))
+    ut = await usdt_toman(); tb = await ton_base()
+    ch = ts_fmt(P["chan_ts"]) if P["chan_ts"] else "هنوز نخونده"
+    st = ", ".join(f"{k}={v:,.0f}" for k, v in sorted(TBL["stars"].items())) or "-"
+    pr = ", ".join(f"{k}m={v:,.0f}" for k, v in sorted(TBL["prem"].items())) or "-"
+    await m.answer(f"💲 نرخ تتر فعال: {ut:,.0f} تومان (کانال: {P['usdt_toman_chan']:,.0f})\n"
+                   f"💎 قیمت بازار هر تون (بدون سود): {tb:,.0f} تومان\n"
+                   f"   کانال: {P['ton_toman_chan']:,.0f} ({P['ton_usd_chan']}$) | بایننس: {P['ton_usdt']}$\n"
+                   f"🕐 آخرین خوندن کانال: {ch}\n"
+                   f"⭐ استارز (کانال): {st}\n💎 پرمیوم (کانال): {pr}\n\n"
+                   + "\n".join(f"{r['k']} = {r['v']}" for r in rows))
 
-@ar.message(Command("fragment"))
-async def adm_fragment(m: Message):
-    await m.answer("⏳ در حال دریافت از فراگمنت...")
-    await m.answer(await update_fragment_prices() or "-")
+@ar.message(Command("setton"))
+async def adm_setton(m: Message):
+    p = m.text.split()
+    if len(p) != 2: return await m.answer("استفاده: /setton 430000 (قیمت بازار هر تون به تومان؛ برای حالت خودکار 0)")
+    try: v = float(norm(p[1]))
+    except Exception: return await m.answer("عدد معتبر وارد کنید.")
+    if v != 0 and not (10000 <= v <= 10000000): return await m.answer("عدد غیرمنطقیه.")
+    await execute("UPDATE settings SET v=? WHERE k='ton_toman_manual'", (str(v),))
+    await m.answer("✅ ثبت شد." if v else "✅ قیمت تون دوباره خودکار شد.")
 
 @ar.message(Command("set"))
 async def adm_set(m: Message):
@@ -881,14 +1031,32 @@ async def adm_credit(m: Message):
     await execute("UPDATE users SET ton_nano=ton_nano+? WHERE id=?", (int(float(p[2]) * NANO), int(p[1])))
     await to_user(int(p[1]), f"✅ مبلغ {p[2]} TON به کیف پول شما اضافه شد."); await m.answer("✅")
 
+@ar.message(Command("creditrial"))
+async def adm_credit_rial(m: Message):
+    p = m.text.split()
+    if len(p) != 3: return await m.answer("استفاده: /creditrial آیدی_کاربر مبلغ_تومان")
+    v = int(float(norm(p[2])))
+    await execute("UPDATE users SET toman_balance=toman_balance+? WHERE id=?", (v, int(p[1])))
+    await to_user(int(p[1]), f"✅ مبلغ {fm(v)} تومان به موجودی ریالی شما اضافه شد."); await m.answer("✅")
+
+@ar.message(Command("creditdisc"))
+async def adm_credit_disc(m: Message):
+    p = m.text.split()
+    if len(p) != 3: return await m.answer("استفاده: /creditdisc آیدی_کاربر مبلغ_تومان")
+    v = int(float(norm(p[2])))
+    await execute("UPDATE users SET discount_balance=discount_balance+? WHERE id=?", (v, int(p[1])))
+    await execute("INSERT INTO discounts(user_id,amount,reason,created) VALUES(?,?,?,?)", (int(p[1]), v, "هدیه از طرف فروشگاه", now()))
+    await to_user(int(p[1]), f"🎁 مبلغ {fm(v)} تومان تخفیف به حساب شما اضافه شد."); await m.answer("✅")
+
 @ar.message(Command("stats"))
 async def adm_stats(m: Message):
     n = (await fetchone("SELECT COUNT(*) c FROM users"))["c"]
     pend = (await fetchone("SELECT COUNT(*) c FROM orders WHERE status='pending'"))["c"]
     tot = (await fetchone("SELECT COALESCE(SUM(toman),0) s FROM orders WHERE status='approved'"))["s"]
     bal = (await fetchone("SELECT COALESCE(SUM(ton_nano),0) s FROM users"))["s"]
+    rial = (await fetchone("SELECT COALESCE(SUM(toman_balance),0) a, COALESCE(SUM(discount_balance),0) b FROM users"))
     await m.answer(f"👥 کاربران: {n}\n⏳ سفارش در انتظار: {pend}\n💰 مجموع فروش تاییدشده: {fm(tot)} تومان\n"
-                   f"👛 مجموع موجودی کاربران: {bal / NANO:.4f} TON")
+                   f"👛 مجموع موجودی کاربران: {bal / NANO:.4f} TON\n💵 موجودی ریالی کاربران: {fm(rial['a'])} تومان\n🎁 تخفیف‌های بدهکار: {fm(rial['b'])} تومان")
 
 @ar.message(Command("broadcast"))
 async def adm_bc(m: Message):
