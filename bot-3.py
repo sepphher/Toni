@@ -1079,7 +1079,8 @@ async def main():
     await asyncio.gather(
         dpu.start_polling(user_bot, handle_signals=False),
         dpa.start_polling(admin_bot, handle_signals=False),
-        price_loop(), fragment_loop(), expiry_loop(), backup_loop())
+        price_loop(), frag_loop(), expiry_loop(), backup_loop()
+
 
 if __name__ == "__main__":
     asyncio.run(main())
